@@ -181,6 +181,7 @@ func getTokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 <html>
 <head>
     <title>Authentication Successful</title>
+    <meta charset="utf-8">
     <style>
         body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
         .success { color: #4CAF50; font-size: 24px; }
