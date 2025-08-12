@@ -1,4 +1,4 @@
-module github.com/ngs/freecal
+module go.ngs.io/freecal
 
 go 1.23.0
 
