@@ -2,6 +2,12 @@
 
 A command-line tool to find free time slots in your Google Calendar. It fetches events from Google Calendar and outputs available time slots during business hours in Markdown format.
 
+## Quick Install
+
+```bash
+go install go.ngs.io/freecal@latest
+```
+
 ## Features
 
 - Fetches events from Google Calendar using OAuth2 authentication
