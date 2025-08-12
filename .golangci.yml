@@ -4,18 +4,13 @@
 run:
   timeout: 5m
   tests: true
-  skip-dirs:
-    - vendor
 
 linters:
   enable:
     - bodyclose
-    - deadcode
-    - depguard
     - dogsled
     - dupl
     - errcheck
-    - exportloopref
     - exhaustive
     - gochecknoinits
     - goconst
@@ -23,9 +18,6 @@ linters:
     - gocyclo
     - gofmt
     - goimports
-    - golint
-    - gomnd
-    - goprintffuncname
     - gosec
     - gosimple
     - govet
@@ -37,13 +29,11 @@ linters:
     - nolintlint
     - rowserrcheck
     - staticcheck
-    - structcheck
     - stylecheck
     - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
     - prealloc
 
@@ -51,22 +41,21 @@ linters:
     - gochecknoglobals
     - godox
     - godot
-    - goerr113
+    - err113
     - testpackage
     - wsl
     - funlen
-    - exhaustivestruct
     - wrapcheck
     - nlreturn
 
 linters-settings:
   gocyclo:
     min-complexity: 15
-  
+
   goconst:
     min-len: 2
     min-occurrences: 2
-  
+
   gocritic:
     enabled-tags:
       - diagnostic
@@ -77,52 +66,43 @@ linters-settings:
     disabled-checks:
       - dupImport
       - commentedOutCode
-  
-  gomnd:
-    settings:
-      mnd:
-        checks: argument,case,condition,operation,return,assign
-        ignored-numbers: 0,1,2,3,4,5,10,100,1000
-  
+
   govet:
-    check-shadowing: true
-  
+    enable:
+      - shadow
+
   lll:
     line-length: 140
-  
+
   misspell:
     locale: US
-  
+
   nolintlint:
     allow-leading-space: true
     allow-unused: false
     require-explanation: false
     require-specific: false
-  
+
   errcheck:
     check-type-assertions: true
     check-blank: true
 
 issues:
+  exclude-dirs:
+    - vendor
+
   exclude-rules:
     - path: _test\.go
       linters:
-        - gomnd
         - gosec
         - dupl
-    
-    - path: main\.go
-      linters:
-        - gomnd
-      text: "Magic number"
-    
-    # Exclude some linters from running on tests files.
-    - path: _test\.go
-      linters:
         - gocyclo
         - errcheck
-        - dupl
-        - gosec
+
+    - path: main\.go
+      linters:
+        - gocyclo
+      text: "Magic number"
 
   max-issues-per-linter: 0
   max-same-issues: 0

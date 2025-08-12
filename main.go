@@ -52,6 +52,8 @@ func mustParseClock(s string) (h, m int) {
 	return t.Hour(), t.Minute()
 }
 
+const sundayJP = "日"
+
 func formatJpWeekday(t time.Time) string {
 	switch t.Weekday() {
 	case time.Monday:
@@ -66,8 +68,10 @@ func formatJpWeekday(t time.Time) string {
 		return "金"
 	case time.Saturday:
 		return "土"
+	case time.Sunday:
+		return sundayJP
 	default:
-		return "日"
+		return sundayJP
 	}
 }
 
@@ -105,41 +109,50 @@ func mergeIntervals(in []interval) []interval {
 
 // OAuth helper ---------------------------------------------
 
-func getClient(ctx context.Context, credentialsPath, tokenPath string, scopes ...string) *oauth2.TokenSource {
+func getClient(ctx context.Context, credentialsPath, tokenPath string, scopes ...string) (oauth2.TokenSource, error) {
 	b, err := os.ReadFile(credentialsPath)
 	if err != nil {
-		log.Fatalf("unable to read credentials: %v", err)
+		return nil, fmt.Errorf("unable to read credentials: %w", err)
 	}
 	config, err := google.ConfigFromJSON(b, scopes...)
 	if err != nil {
-		log.Fatalf("unable to parse credentials: %v", err)
+		return nil, fmt.Errorf("unable to parse credentials: %w", err)
 	}
 
 	// Try load saved token
 	var tok *oauth2.Token
 	if f, err := os.Open(tokenPath); err == nil {
 		defer f.Close()
-		_ = json.NewDecoder(f).Decode(&tok)
+		if err := json.NewDecoder(f).Decode(&tok); err != nil {
+			log.Printf("warning: failed to decode token: %v", err)
+			tok = nil
+		}
 	}
 
 	if tok == nil || !tok.Valid() {
 		// Use local redirect server for OAuth flow
 		tok = getTokenFromWeb(ctx, config)
 		if tok == nil {
-			log.Fatalf("unable to retrieve token")
+			return nil, fmt.Errorf("unable to retrieve token")
 		}
 
 		// Save token
-		if f, err := os.Create(tokenPath); err == nil {
-			defer f.Close()
-			_ = json.NewEncoder(f).Encode(tok)
-		} else {
+		if err := saveToken(tokenPath, tok); err != nil {
 			log.Printf("warning: failed to save token: %v", err)
 		}
 	}
 
 	ts := config.TokenSource(ctx, tok)
-	return &ts
+	return ts, nil
+}
+
+func saveToken(tokenPath string, tok *oauth2.Token) error {
+	f, err := os.Create(tokenPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewEncoder(f).Encode(tok)
 }
 
 func getTokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
@@ -148,7 +161,10 @@ func getTokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 	errorCh := make(chan error, 1)
 
 	// Use localhost with a random available port
-	server := &http.Server{Addr: "localhost:0"}
+	server := &http.Server{
+		Addr:              "localhost:0",
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	// Setup handler for OAuth callback
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -185,11 +201,15 @@ func getTokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		log.Fatalf("failed to get TCP address")
+	}
+	port := tcpAddr.Port
 
 	go func() {
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			errorCh <- err
+		if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			errorCh <- serveErr
 		}
 	}()
 
@@ -211,18 +231,18 @@ func getTokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 	select {
 	case code = <-codeCh:
 		fmt.Println("Authorization code received!")
-	case err := <-errorCh:
-		log.Fatalf("server error: %v", err)
+	case serverErr := <-errorCh:
+		log.Fatalf("server error: %v", serverErr)
 	case <-time.After(5 * time.Minute):
 		log.Fatalf("timeout waiting for authorization")
 	}
 
 	// Shutdown the server
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("server shutdown error: %v", err)
+	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
+		log.Printf("server shutdown error: %v", shutdownErr)
 	}
+	cancel()
 
 	// Exchange code for token
 	tok, err := config.Exchange(ctx, code)
@@ -254,62 +274,48 @@ func openBrowser(url string) {
 
 // -----------------------------------------------------------
 
-func main() {
-	var (
-		credentialsPath string
-		tokenPath       string
-		calendarID      string
-		startStr        string
-		endStr          string
-		workStart       string
-		workEnd         string
-		minMinutes      int
-		tzName          string
-	)
-	flag.StringVar(&credentialsPath, "credentials", "", "Path to OAuth client credentials (credentials.json)")
-	flag.StringVar(&tokenPath, "token", "token.json", "Path to save/load OAuth token")
-	flag.StringVar(&calendarID, "calendar", "primary", "Calendar ID (e.g., primary or somebody@example.com)")
-	flag.StringVar(&startStr, "start", "", "Start date (YYYY-MM-DD)")
-	flag.StringVar(&endStr, "end", "", "End date (YYYY-MM-DD)")
-	flag.StringVar(&workStart, "workstart", "09:00", "Workday start (HH:MM)")
-	flag.StringVar(&workEnd, "workend", "17:00", "Workday end (HH:MM)")
-	flag.IntVar(&minMinutes, "min", 60, "Minimum free slot length in minutes")
-	flag.StringVar(&tzName, "tz", "Asia/Tokyo", "IANA timezone (e.g., Asia/Tokyo)")
+type config struct {
+	credentialsPath string
+	tokenPath       string
+	calendarID      string
+	startStr        string
+	endStr          string
+	workStart       string
+	workEnd         string
+	minMinutes      int
+	tzName          string
+}
+
+func parseFlags() *config {
+	c := &config{}
+	flag.StringVar(&c.credentialsPath, "credentials", "",
+		"Path to OAuth client credentials (credentials.json)")
+	flag.StringVar(&c.tokenPath, "token", "token.json", "Path to save/load OAuth token")
+	flag.StringVar(&c.calendarID, "calendar", "primary",
+		"Calendar ID (e.g., primary or somebody@example.com)")
+	flag.StringVar(&c.startStr, "start", "", "Start date (YYYY-MM-DD)")
+	flag.StringVar(&c.endStr, "end", "", "End date (YYYY-MM-DD)")
+	flag.StringVar(&c.workStart, "workstart", "09:00", "Workday start (HH:MM)")
+	flag.StringVar(&c.workEnd, "workend", "17:00", "Workday end (HH:MM)")
+	flag.IntVar(&c.minMinutes, "min", 60, "Minimum free slot length in minutes")
+	flag.StringVar(&c.tzName, "tz", "Asia/Tokyo", "IANA timezone (e.g., Asia/Tokyo)")
 	flag.Parse()
 
-	if credentialsPath == "" || startStr == "" || endStr == "" {
+	if c.credentialsPath == "" || c.startStr == "" || c.endStr == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
 
-	loc, err := time.LoadLocation(tzName)
-	if err != nil {
-		log.Fatalf("failed to load timezone %q: %v", tzName, err)
-	}
+	return c
+}
 
-	startDate, err := time.ParseInLocation("2006-01-02", startStr, loc)
-	if err != nil {
-		log.Fatalf("invalid -start: %v", err)
-	}
-	endDate, err := time.ParseInLocation("2006-01-02", endStr, loc)
-	if err != nil {
-		log.Fatalf("invalid -end: %v", err)
-	}
-	if endDate.Before(startDate) {
-		log.Fatalf("-end is before -start")
-	}
-
-	wsH, wsM := mustParseClock(workStart)
-	weH, weM := mustParseClock(workEnd)
-
-	ctx := context.Background()
-	ts := getClient(ctx, credentialsPath, tokenPath, calendar.CalendarReadonlyScope)
-	svc, err := calendar.NewService(ctx, option.WithTokenSource(*ts))
-	if err != nil {
-		log.Fatalf("unable to create calendar service: %v", err)
-	}
-
-	// Fetch events in range (expand singleEvents: true to get recurrences expanded)
+func fetchCalendarEvents(
+	_ context.Context,
+	svc *calendar.Service,
+	calendarID string,
+	startDate, endDate time.Time,
+	loc *time.Location,
+) ([]*calendar.Event, error) {
 	timeMin := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, loc).Format(time.RFC3339)
 	timeMax := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, loc).Format(time.RFC3339)
 
@@ -328,7 +334,7 @@ func main() {
 		}
 		resp, err := eventsCall.Do()
 		if err != nil {
-			log.Fatalf("events list error: %v", err)
+			return nil, err
 		}
 		events = append(events, resp.Items...)
 		if resp.NextPageToken == "" {
@@ -336,39 +342,48 @@ func main() {
 		}
 		pageToken = resp.NextPageToken
 	}
+	return events, nil
+}
 
-	// Convert events to intervals in target TZ, skip TRANSPARENT and cancelled
-	var busyAll []interval
+func parseEventTime(e *calendar.Event, loc *time.Location) (start, end time.Time, ok bool) {
+	if e.Start != nil && e.Start.DateTime != "" && e.End != nil && e.End.DateTime != "" {
+		// timed event
+		ss, err1 := time.Parse(time.RFC3339, e.Start.DateTime)
+		ee, err2 := time.Parse(time.RFC3339, e.End.DateTime)
+		if err1 != nil || err2 != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		return ss.In(loc), ee.In(loc), true
+	}
+
+	if e.Start != nil && e.Start.Date != "" && e.End != nil && e.End.Date != "" {
+		// all-day (dates are in calendar's timezone)
+		ds, err1 := time.ParseInLocation("2006-01-02", e.Start.Date, loc)
+		de, err2 := time.ParseInLocation("2006-01-02", e.End.Date, loc)
+		if err1 != nil || err2 != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		// all-day spans [start 00:00, end 00:00 next-day)
+		s := time.Date(ds.Year(), ds.Month(), ds.Day(), 0, 0, 0, 0, loc)
+		en := time.Date(de.Year(), de.Month(), de.Day(), 0, 0, 0, 0, loc)
+		return s, en, true
+	}
+
+	return time.Time{}, time.Time{}, false
+}
+
+func eventsToIntervals(events []*calendar.Event, loc *time.Location) []interval {
+	busyAll := make([]interval, 0, len(events))
 	for _, e := range events {
-		if strings.EqualFold(e.Status, "cancelled") {
+		if strings.EqualFold(e.Status, "canceled") {
 			continue
 		}
 		if strings.EqualFold(e.Transparency, "transparent") {
 			continue // free events
 		}
 
-		var s, en time.Time
-		switch {
-		case e.Start != nil && e.Start.DateTime != "" && e.End != nil && e.End.DateTime != "":
-			// timed event
-			ss, err1 := time.Parse(time.RFC3339, e.Start.DateTime)
-			ee, err2 := time.Parse(time.RFC3339, e.End.DateTime)
-			if err1 != nil || err2 != nil {
-				continue
-			}
-			s = ss.In(loc)
-			en = ee.In(loc)
-		case e.Start != nil && e.Start.Date != "" && e.End != nil && e.End.Date != "":
-			// all-day (dates are in calendar's timezone)
-			ds, err1 := time.ParseInLocation("2006-01-02", e.Start.Date, loc)
-			de, err2 := time.ParseInLocation("2006-01-02", e.End.Date, loc)
-			if err1 != nil || err2 != nil {
-				continue
-			}
-			// all-day spans [start 00:00, end 00:00 next-day)
-			s = time.Date(ds.Year(), ds.Month(), ds.Day(), 0, 0, 0, 0, loc)
-			en = time.Date(de.Year(), de.Month(), de.Day(), 0, 0, 0, 0, loc)
-		default:
+		s, en, ok := parseEventTime(e, loc)
+		if !ok {
 			continue
 		}
 		if !en.After(s) {
@@ -376,49 +391,102 @@ func main() {
 		}
 		busyAll = append(busyAll, interval{start: s, end: en})
 	}
+	return busyAll
+}
 
-	// Iterate weekdays and print free slots (>= minMinutes)
-	minDur := time.Duration(minMinutes) * time.Minute
+func findFreeSlots(dayStart, dayEnd time.Time, busyAll []interval, minDur time.Duration) []string {
+	dayWin := interval{start: dayStart, end: dayEnd}
+
+	// collect and merge overlaps with day window
+	var busy []interval
+	for _, ev := range busyAll {
+		if inter, ok := overlaps(ev, dayWin); ok {
+			busy = append(busy, inter)
+		}
+	}
+	busy = mergeIntervals(busy)
+
+	// free slots
+	var free []interval
+	cursor := dayStart
+	for _, b := range busy {
+		if b.start.After(cursor) {
+			free = append(free, interval{start: cursor, end: b.start})
+		}
+		if b.end.After(cursor) {
+			cursor = b.end
+		}
+	}
+	if cursor.Before(dayEnd) {
+		free = append(free, interval{start: cursor, end: dayEnd})
+	}
+
+	// filter by min
+	var out []string
+	for _, f := range free {
+		if f.end.Sub(f.start) >= minDur {
+			out = append(out, fmt.Sprintf("%02d:%02d~%02d:%02d",
+				f.start.Hour(), f.start.Minute(), f.end.Hour(), f.end.Minute()))
+		}
+	}
+	return out
+}
+
+// -----------------------------------------------------------
+
+func main() {
+	cfg := parseFlags()
+
+	loc, err := time.LoadLocation(cfg.tzName)
+	if err != nil {
+		log.Fatalf("failed to load timezone %q: %v", cfg.tzName, err)
+	}
+
+	startDate, err := time.ParseInLocation("2006-01-02", cfg.startStr, loc)
+	if err != nil {
+		log.Fatalf("invalid -start: %v", err)
+	}
+	endDate, err := time.ParseInLocation("2006-01-02", cfg.endStr, loc)
+	if err != nil {
+		log.Fatalf("invalid -end: %v", err)
+	}
+	if endDate.Before(startDate) {
+		log.Fatalf("-end is before -start")
+	}
+
+	wsH, wsM := mustParseClock(cfg.workStart)
+	weH, weM := mustParseClock(cfg.workEnd)
+
+	ctx := context.Background()
+	ts, err := getClient(ctx, cfg.credentialsPath, cfg.tokenPath, calendar.CalendarReadonlyScope)
+	if err != nil {
+		log.Fatalf("unable to get client: %v", err)
+	}
+	svc, err := calendar.NewService(ctx, option.WithTokenSource(ts))
+	if err != nil {
+		log.Fatalf("unable to create calendar service: %v", err)
+	}
+
+	// Fetch events
+	events, err := fetchCalendarEvents(ctx, svc, cfg.calendarID, startDate, endDate, loc)
+	if err != nil {
+		log.Fatalf("events list error: %v", err)
+	}
+
+	// Convert to intervals
+	busyAll := eventsToIntervals(events, loc)
+
+	// Iterate weekdays and print free slots
+	minDur := time.Duration(cfg.minMinutes) * time.Minute
 	for day := startDate; !day.After(endDate); day = day.AddDate(0, 0, 1) {
 		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
 			continue
 		}
+
 		dayStart := time.Date(day.Year(), day.Month(), day.Day(), wsH, wsM, 0, 0, loc)
 		dayEnd := time.Date(day.Year(), day.Month(), day.Day(), weH, weM, 0, 0, loc)
-		dayWin := interval{start: dayStart, end: dayEnd}
 
-		// collect and merge overlaps with day window
-		var busy []interval
-		for _, ev := range busyAll {
-			if inter, ok := overlaps(ev, dayWin); ok {
-				busy = append(busy, inter)
-			}
-		}
-		busy = mergeIntervals(busy)
-
-		// free slots
-		var free []interval
-		cursor := dayStart
-		for _, b := range busy {
-			if b.start.After(cursor) {
-				free = append(free, interval{start: cursor, end: b.start})
-			}
-			if b.end.After(cursor) {
-				cursor = b.end
-			}
-		}
-		if cursor.Before(dayEnd) {
-			free = append(free, interval{start: cursor, end: dayEnd})
-		}
-
-		// filter by min
-		var out []string
-		for _, f := range free {
-			if f.end.Sub(f.start) >= minDur {
-				out = append(out, fmt.Sprintf("%02d:%02d~%02d:%02d",
-					f.start.Hour(), f.start.Minute(), f.end.Hour(), f.end.Minute()))
-			}
-		}
+		out := findFreeSlots(dayStart, dayEnd, busyAll, minDur)
 		if len(out) == 0 {
 			continue
 		}

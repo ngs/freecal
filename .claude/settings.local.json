@@ -6,7 +6,10 @@
       "Bash(go test:*)",
       "Bash(mkdir:*)",
       "Bash(gofmt:*)",
-      "Bash(go vet:*)"
+      "Bash(go vet:*)",
+      "Bash(golangci-lint run:*)",
+      "Bash(go install:*)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": [],
     "ask": []
